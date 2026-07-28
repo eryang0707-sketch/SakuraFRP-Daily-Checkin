@@ -44,20 +44,23 @@ jobs:
 
           cat > .env <<EOF
           ZHIPU_API_KEY=${{ secrets.ZHIPU_API_KEY }}
-          ZHIPU_MODEL_VISION=glm-4v-flash
-          ZHIPU_MODEL_TEXT=glm-4-flash
+          ZHIPU_MODEL_VISION=glm-4.6v-flash
+          ZHIPU_MODEL_TEXT=glm-4.7-flash
           SCHEDULE_TIME=12:00
           HTTP_PROXY=${{ secrets.HTTP_PROXY }}
           USE_STATE_CACHE=false
           EMAIL_NOTIFY_ENABLED=true
+          EMAIL_NOTIFY_POLICY=${{ vars.EMAIL_NOTIFY_POLICY || 'failure_only' }}
           EMAIL_SMTP_HOST=smtp.qq.com
           EMAIL_SMTP_USER=${{ secrets.EMAIL_SMTP_USER }}
           EMAIL_SMTP_PASSWORD=${{ secrets.EMAIL_SMTP_PASSWORD }}
           EMAIL_TO=${{ secrets.EMAIL_TO }}
-          FAIL_ALERT_ENABLED=true
+          FAIL_ALERT_ENABLED=false
           FAIL_ALERT_THRESHOLD=2
           CAPTCHA_EXTRA_ROUND_ENABLED=true
-          CAPTCHA_EXTRA_ROUND_ATTEMPTS=2
+          CAPTCHA_EXTRA_ROUND_ATTEMPTS=3
+          AI_CALL_MAX_RETRIES=2
+          AI_CELL_WORKERS=3
           CHECKIN_MAX_RETRIES=5
           CHECKIN_RETRY_INTERVAL_SECONDS=30
           EOF

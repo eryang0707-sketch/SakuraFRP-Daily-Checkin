@@ -92,14 +92,42 @@ python main.py --both
 在 `.env` 中常用配置如下：
 
 - `ZHIPU_API_KEY`: 智谱 API Key
-- `EMAIL_NOTIFY_ENABLED`: 是否启用邮件
-- `EMAIL_SMTP_HOST/USER/PASSWORD`: SMTP 配置
-- `EMAIL_TO`: 收件人
+- `ZHIPU_MODEL_VISION`: 视觉模型（默认 `glm-4.6v-flash`）
+- `ZHIPU_MODEL_TEXT`: 文本模型（默认 `glm-4.7-flash`）
+- `AI_CALL_MAX_RETRIES`: AI 调用失败重试次数
+- `AI_CELL_WORKERS`: 九宫格逐格识别并发数（建议 2-4）
 - `USE_STATE_CACHE`: 是否复用 state 登录态（推荐 `false`）
 - `CAPTCHA_EXTRA_ROUND_ENABLED`: 验证码额外重试开关
 - `CAPTCHA_EXTRA_ROUND_ATTEMPTS`: 验证码额外重试次数
 - `CHECKIN_MAX_RETRIES`: 外层重试次数（建议 5）
 - `CHECKIN_RETRY_INTERVAL_SECONDS`: 外层重试间隔秒数（建议 30）
+
+### 4.1 验证码识别策略
+
+九宫格识别按以下顺序推进，任一步命中即提交：
+
+1. 等待格子图片真正加载完成（`img.complete` + 容器不透明度稳定）后再截图
+2. 整图直选：把完整九宫格交给视觉模型，一次返回命中编号
+3. 回退逐格识别：切成 9 张单格图并发识别，再交文本模型做语义裁决
+4. 兜底名称匹配：目标与格子描述互为子串即命中
+5. 提交后校验，出现“验证失败”文案立即刷新换题，不浪费重试轮次
+
+### 4.2 邮件通知策略
+
+用 `EMAIL_NOTIFY_POLICY` 控制打扰程度：
+
+| 取值 | 行为 |
+| --- | --- |
+| `none` | 从不发邮件 |
+| `failure_only` | **默认**，仅最终失败时发 |
+| `change` | 最终失败 + 当天首次签到成功；“今日已签到”不发 |
+| `all` | 每次运行都发（旧行为） |
+
+另外两点：
+
+- 单次运行最多发一封邮件，失败邮件与连续失败告警邮件不再重复轰炸
+- `FAIL_ALERT_ENABLED` 默认改为 `false`。GitHub Actions runner 每次都是干净环境，
+  `alert_state.json` 无法跨天保留，连续失败计数在 CI 下本就不成立
 
 ## 5. GitHub Actions 部署
 

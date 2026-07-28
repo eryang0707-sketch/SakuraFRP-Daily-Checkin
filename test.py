@@ -265,8 +265,8 @@ def test_zhipu_api():
     
     # 读取配置
     api_key = os.getenv("ZHIPU_API_KEY")
-    model_vision = os.getenv("ZHIPU_MODEL_VISION", "glm-4v-flash")
-    model_text = os.getenv("ZHIPU_MODEL_TEXT", "glm-4-flash")
+    model_vision = os.getenv("ZHIPU_MODEL_VISION", "glm-4.6v-flash")
+    model_text = os.getenv("ZHIPU_MODEL_TEXT", "glm-4.7-flash")
     
     # 显示配置信息（隐藏敏感信息）
     if api_key and len(api_key) > 30:
@@ -389,7 +389,7 @@ def test_zhipu_api():
         if "401" in str(e) or "authentication" in str(e).lower():
             print("  提示: API Key 可能无效或已过期")
         elif "model" in str(e).lower():
-            print("  提示: 模型名称可能不正确，请检查是否为 glm-4v-flash")
+            print("  提示: 模型名称可能不正确，请检查 ZHIPU_MODEL_VISION（如 glm-4.6v-flash）")
         elif "quota" in str(e).lower() or "balance" in str(e).lower():
             print("  提示: API 配额可能已用完")
         return False

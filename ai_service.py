@@ -2,94 +2,204 @@ import base64
 import json
 import re
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from dotenv import load_dotenv
 from zhipuai import ZhipuAI
 
 # 加载环境变量
 load_dotenv()
 
+# 题目名称中常见的前缀噪声（模型偶尔会返回整句话）
+_TARGET_PREFIX_PATTERN = re.compile(
+    r'^(图中是|图中的|图片中是|图片中的|图片里是|图片里的|这张图片?是|这是|该图是|答案是|物体名称是|名称是)'
+)
+_TARGET_QUANTIFIER_PATTERN = re.compile(r'^(一个|一只|一张|一把|一条|一台|一辆|一双|一部|一副)')
+
+
+def clean_target_name(text):
+    """把模型返回的题目文本收敛成一个干净的物体名称"""
+    if not text:
+        return ""
+
+    name = text.strip().splitlines()[0].strip()
+    for _ in range(3):
+        new_name = _TARGET_PREFIX_PATTERN.sub("", name).strip()
+        new_name = _TARGET_QUANTIFIER_PATTERN.sub("", new_name).strip()
+        if new_name == name:
+            break
+        name = new_name
+
+    name = re.sub(r'[^\w]', '', name)
+    return name[:20]
+
+
 class AIService:
     """AI服务类，封装所有AI调用逻辑"""
-    
+
     def __init__(self):
         """初始化AI服务，从环境变量读取配置"""
         self.api_key = os.getenv("ZHIPU_API_KEY", "")
-        self.model_vision = os.getenv("ZHIPU_MODEL_VISION", "glm-4v-flash")
-        self.model_text = os.getenv("ZHIPU_MODEL_TEXT", "glm-4-flash")
-        
+        self.model_vision = os.getenv("ZHIPU_MODEL_VISION", "glm-4.6v-flash")
+        self.model_text = os.getenv("ZHIPU_MODEL_TEXT", "glm-4.7-flash")
+
+        try:
+            self.max_retries = max(0, int(os.getenv("AI_CALL_MAX_RETRIES", "2").strip()))
+        except Exception:
+            self.max_retries = 2
+
+        try:
+            self.cell_workers = max(1, int(os.getenv("AI_CELL_WORKERS", "3").strip()))
+        except Exception:
+            self.cell_workers = 3
+
         if not self.api_key:
             raise ValueError("未找到ZHIPU_API_KEY环境变量，请在.env文件中配置")
-        
+
         self.client = ZhipuAI(api_key=self.api_key)
-    
+
+    # ---------------- 基础调用 ----------------
+    def _chat(self, model, messages):
+        """带重试的对话调用，返回纯文本；失败返回空串"""
+        last_error = None
+        for i in range(self.max_retries + 1):
+            try:
+                response = self.client.chat.completions.create(model=model, messages=messages)
+                return (response.choices[0].message.content or "").strip()
+            except Exception as e:
+                last_error = e
+                print(f"[WARNING] AI 调用失败 {i + 1}/{self.max_retries + 1} ({model}): {e}")
+                if i < self.max_retries:
+                    time.sleep(1.5 * (i + 1))
+
+        print(f"[ERROR] AI API 调用失败 ({model}): {last_error}")
+        return ""
+
     def safe_parse_json(self, text):
         """强力解析 AI 返回的 JSON 列表"""
+        if not text:
+            return None
         try:
-            # 尝试使用正则提取最近的一组方括号内容
-            match = re.search(r'\[.*\]', text, re.DOTALL)
+            # 去掉 markdown 代码围栏，模型经常返回 ```json ... ```
+            cleaned = re.sub(r'```[a-zA-Z]*', '', text).replace('```', '').strip()
+            match = re.search(r'\[.*\]', cleaned, re.DOTALL)
             if match:
                 return json.loads(match.group())
-            return json.loads(text)
+            return json.loads(cleaned)
         except Exception:
             return None
-    
+
     def call_vision(self, image_bytes, prompt):
-        """调用智谱多模态模型"""
-        base64_data = base64.b64encode(image_bytes).decode('utf-8')
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_vision,
-                messages=[{
-                    "role": "user",
-                    "content": [
-                        {"type": "text", "text": prompt},
-                        {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_data}"}}
-                    ]
-                }]
-            )
-            return response.choices[0].message.content.strip()
-        except Exception as e:
-            print(f"[ERROR] AI API 调用失败: {e}")
-            return ""
-    
+        """调用智谱多模态模型，image_bytes 支持单张图或图片列表"""
+        images = image_bytes if isinstance(image_bytes, (list, tuple)) else [image_bytes]
+        content = [{"type": "text", "text": prompt}]
+        for img in images:
+            if not img:
+                continue
+            b64 = base64.b64encode(img).decode('utf-8')
+            content.append({"type": "image_url", "image_url": {"url": f"data:image/png;base64,{b64}"}})
+
+        return self._chat(self.model_vision, [{"role": "user", "content": content}])
+
+    # ---------------- 九宫格识别 ----------------
+    def recognize_tip_object(self, tip_img_bytes):
+        """识别题目提示图中的物体名称"""
+        prompt = (
+            "这是验证码的题目提示图，图中只有一个物体。\n"
+            "只回答该物体的中文名称（2-6个字），不要句子、不要标点、不要解释。"
+        )
+        raw = self.call_vision(tip_img_bytes, prompt)
+        target = clean_target_name(raw)
+        print(f"[AI] 题目识别原始输出: {raw!r} -> 清洗后: {target!r}")
+        return target
+
+    def select_matching_cells(self, target, grid_img_bytes):
+        """整图直选：把完整九宫格交给视觉模型，直接返回命中格子编号"""
+        if not target:
+            return []
+
+        prompt = (
+            f"这是一张 3x3 九宫格验证码图片，格子编号规则：第一行从左到右为 1、2、3，"
+            f"第二行为 4、5、6，第三行为 7、8、9。\n"
+            f"请找出其中内容是【{target}】的所有格子编号（同一物体的不同角度、不同材质、"
+            f"玩具或模型也算命中）。\n"
+            f"要求：只返回一个 JSON 整数数组，例如 [1, 5]；没有任何格子命中时返回 []；"
+            f"不要输出解释文字。"
+        )
+        raw = self.call_vision(grid_img_bytes, prompt)
+        print(f"[AI] 整图直选原始输出: {raw!r}")
+        parsed = self.safe_parse_json(raw)
+        return parsed if isinstance(parsed, list) else []
+
+    def describe_cell(self, cell_img_bytes, cell_index):
+        """识别单个格子的物体名称"""
+        prompt = (
+            "这是验证码九宫格中的一个格子。只回答格子里物体的中文名称（2-6个字）。\n"
+            "如果格子是空白、纯色或看不出物体，只回答：空白。\n"
+            "不要标点、不要解释、不要返回 JSON。"
+        )
+        raw = self.call_vision(cell_img_bytes, prompt)
+        name = clean_target_name(raw) or "未知"
+        print(f"[AI] 格子 {cell_index} 识别结果: {name}")
+        return name
+
+    def describe_cells(self, cell_img_bytes_list):
+        """并发识别 9 个格子，返回按序排列的描述列表"""
+        indexed = list(enumerate(cell_img_bytes_list, start=1))
+        results = [None] * len(indexed)
+
+        def worker(item):
+            idx, img = item
+            return idx, self.describe_cell(img, idx)
+
+        with ThreadPoolExecutor(max_workers=self.cell_workers) as pool:
+            for idx, name in pool.map(worker, indexed):
+                results[idx - 1] = name
+
+        return [r or "未知" for r in results]
+
     def identify_captcha_row(self, row_img_bytes, row_index):
-        """分行识别逻辑"""
-        prompt = "这是验证码的一行图片，包含3个格子。请从左到右识别这3个格子的物体名称，只返回一个 JSON 字符串数组，例如：[\"猫\", \"狗\", \"汽车\"]。不要有任何解释文字。"
+        """分行识别逻辑（保留兼容接口，主流程已改为逐格识别）"""
+        prompt = (
+            "这是验证码的一行图片，从左到右包含3个格子。请分别识别这3个格子里的物体名称，"
+            "只返回一个长度为3的 JSON 字符串数组，例如：[\"猫\", \"狗\", \"汽车\"]。"
+            "看不出物体的格子填 \"空白\"。不要有任何解释文字。"
+        )
         res = self.call_vision(row_img_bytes, prompt)
         print(f"[AI] 第 {row_index} 行识别结果: {res}")
-        
+
         parsed = self.safe_parse_json(res)
         if parsed and isinstance(parsed, list):
-            # 确保返回 3 个元素
             while len(parsed) < 3:
                 parsed.append("未知")
             return parsed[:3]
         return ["未知", "未知", "未知"]
-    
+
     def semantic_match(self, target, descriptions):
-        """语义裁决逻辑"""
-        items_text = "\n".join([f"{i+1}. {d}" for i, d in enumerate(descriptions)])
-        prompt = f"题目是：找出图片中所有的【{target}】。\n当前 9 个格子的识别结果如下：\n{items_text}\n请根据描述，判断哪些序号（1-9）最符合题目要求？\n返回格式：只返回 JSON 数组，如 [1, 3, 5]。如果没有符合的，返回空数组 []。"
-        
-        print(f"[Debug] 正在进行语义裁决，描述列表：\n{items_text}")
-        
-        try:
-            response = self.client.chat.completions.create(
-                model=self.model_text,
-                messages=[{"role": "user", "content": prompt}]
-            )
-            content = response.choices[0].message.content.strip()
-            print(f"[AI] 语义裁决原始输出: {content}")
-            parsed = self.safe_parse_json(content)
-            return parsed if isinstance(parsed, list) else []
-        except Exception as e:
-            print(f"[ERROR] 语义匹配失败: {e}")
+        """语义裁决逻辑：基于逐格描述挑出命中编号"""
+        if not target:
             return []
-    
+
+        items_text = "\n".join([f"{i + 1}. {d}" for i, d in enumerate(descriptions)])
+        prompt = (
+            f"题目是：找出九宫格中所有的【{target}】。\n"
+            f"9 个格子的识别描述如下：\n{items_text}\n"
+            f"判断规则：描述与题目指向同一类物体即算命中（含同义词、上下位词、"
+            f"玩具或模型形态）；描述为空白/未知的格子一律不算命中。\n"
+            f"只返回 JSON 整数数组，如 [1, 3, 5]；没有命中返回 []。不要解释。"
+        )
+
+        print(f"[Debug] 正在进行语义裁决，描述列表：\n{items_text}")
+
+        content = self._chat(self.model_text, [{"role": "user", "content": prompt}])
+        print(f"[AI] 语义裁决原始输出: {content}")
+        parsed = self.safe_parse_json(content)
+        return parsed if isinstance(parsed, list) else []
+
+    # ---------------- 滑块识别 ----------------
     def identify_slider_gap(self, bg_img_bytes, slice_img_bytes=None):
         """识别滑块验证码的缺口位置"""
         if slice_img_bytes:
-            # 如果有缺口图，使用对比识别
             prompt = """这是滑块验证码的两张图片：
 1. 第一张是完整的背景图
 2. 第二张是带缺口的拼图块
@@ -99,71 +209,23 @@ class AIService:
 
 只返回一个数字，表示缺口位置的x坐标（像素值），不要有任何其他文字或解释。
 例如：如果缺口在100像素的位置，只返回：100"""
-            
-            base64_bg = base64.b64encode(bg_img_bytes).decode('utf-8')
-            base64_slice = base64.b64encode(slice_img_bytes).decode('utf-8')
-            
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_vision,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_bg}"}},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_slice}"}}
-                        ]
-                    }]
-                )
-                result_text = response.choices[0].message.content.strip()
-                print(f"[AI] 滑块缺口识别结果（原始）: {result_text}")
-                
-                # 提取数字
-                numbers = re.findall(r'\d+', result_text)
-                if numbers:
-                    gap_pos = int(numbers[0])
-                    print(f"[AI] 识别到的缺口位置: {gap_pos}px")
-                    return gap_pos
-                else:
-                    print(f"[WARNING] 无法从AI结果中提取数字: {result_text}")
-                    return 0
-            except Exception as e:
-                print(f"[ERROR] AI识别滑块缺口失败: {e}")
-                return 0
+            result_text = self.call_vision([bg_img_bytes, slice_img_bytes], prompt)
         else:
-            # 如果只有背景图，尝试识别缺口特征
             prompt = """这是滑块验证码的背景图。请识别出图片中缺口的位置。
 缺口通常是一个不规则的形状，与周围有明显的边缘差异。
 
 请识别出缺口在图片中的水平位置（x坐标，单位：像素）。
 只返回一个数字，表示缺口位置的x坐标（像素值），不要有任何其他文字或解释。
 例如：如果缺口在100像素的位置，只返回：100"""
-            
-            base64_bg = base64.b64encode(bg_img_bytes).decode('utf-8')
-            
-            try:
-                response = self.client.chat.completions.create(
-                    model=self.model_vision,
-                    messages=[{
-                        "role": "user",
-                        "content": [
-                            {"type": "text", "text": prompt},
-                            {"type": "image_url", "image_url": {"url": f"data:image/png;base64,{base64_bg}"}}
-                        ]
-                    }]
-                )
-                result_text = response.choices[0].message.content.strip()
-                print(f"[AI] 滑块缺口识别结果（原始）: {result_text}")
-                
-                # 提取数字
-                numbers = re.findall(r'\d+', result_text)
-                if numbers:
-                    gap_pos = int(numbers[0])
-                    print(f"[AI] 识别到的缺口位置: {gap_pos}px")
-                    return gap_pos
-                else:
-                    print(f"[WARNING] 无法从AI结果中提取数字: {result_text}")
-                    return 0
-            except Exception as e:
-                print(f"[ERROR] AI识别滑块缺口失败: {e}")
-                return 0
+            result_text = self.call_vision(bg_img_bytes, prompt)
+
+        print(f"[AI] 滑块缺口识别结果（原始）: {result_text}")
+
+        numbers = re.findall(r'\d+', result_text or "")
+        if numbers:
+            gap_pos = int(numbers[0])
+            print(f"[AI] 识别到的缺口位置: {gap_pos}px")
+            return gap_pos
+
+        print(f"[WARNING] 无法从AI结果中提取数字: {result_text}")
+        return 0

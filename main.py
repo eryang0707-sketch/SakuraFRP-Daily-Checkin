@@ -193,10 +193,47 @@ def get_local_ip():
     except Exception:
         return "unknown"
 
-def send_email_notification(subject, contents, logger=None):
+def env_flag(name, default="false"):
+    """读取布尔型环境变量"""
+    return os.getenv(name, default).strip().lower() in ("1", "true", "yes", "on")
+
+
+def get_notify_policy():
+    """邮件通知策略
+
+    - none:         从不发送
+    - failure_only: 仅最终失败时发送（默认，日常成功不打扰）
+    - change:       最终失败 + 本次新签到成功（跳过"今日已签到"这类无变化场景）
+    - all:          每次运行都发送（旧行为）
+    """
+    policy = os.getenv("EMAIL_NOTIFY_POLICY", "failure_only").strip().lower()
+    if policy not in ("none", "failure_only", "change", "all"):
+        policy = "failure_only"
+    return policy
+
+
+# 单次运行只允许发出一封邮件，避免"失败邮件 + 告警邮件"重复轰炸
+_email_sent_in_run = False
+
+
+def send_email_notification(subject, contents, logger=None, allow_duplicate=False):
     """发送邮件通知的通用函数"""
-    enabled = os.getenv("EMAIL_NOTIFY_ENABLED", "false").strip().lower() in ("1", "true", "yes", "on")
+    global _email_sent_in_run
+
+    enabled = env_flag("EMAIL_NOTIFY_ENABLED")
     if not enabled:
+        return False
+
+    if get_notify_policy() == "none":
+        if logger:
+            logger.log_debug("邮件策略为 none，跳过发送")
+        return False
+
+    if _email_sent_in_run and not allow_duplicate:
+        msg = "本次运行已发送过邮件，跳过重复通知"
+        print(f"[INFO] {msg}")
+        if logger:
+            logger.log_debug(msg)
         return False
 
     smtp_user = os.getenv("EMAIL_SMTP_USER", "").strip()
@@ -223,6 +260,7 @@ def send_email_notification(subject, contents, logger=None):
             subject=subject,
             contents=contents,
         )
+        _email_sent_in_run = True
         print(f"[INFO] 邮件通知已发送: {', '.join(to_list)}")
         if logger:
             logger.log_info(f"邮件通知已发送: {', '.join(to_list)}")
@@ -256,8 +294,12 @@ def save_alert_state(state):
         pass
 
 def update_failure_alert_state(success, reason="", logger=None):
-    """更新连续失败计数并在达到阈值时发送告警邮件"""
-    alert_enabled = os.getenv("FAIL_ALERT_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+    """更新连续失败计数并在达到阈值时发送告警邮件
+
+    注意：告警邮件与失败邮件共用单次运行的发送额度，
+    已发过失败邮件时这里不会再发第二封。
+    """
+    alert_enabled = env_flag("FAIL_ALERT_ENABLED", "true")
     threshold_str = os.getenv("FAIL_ALERT_THRESHOLD", "2").strip()
     try:
         threshold = max(1, int(threshold_str))
@@ -596,28 +638,173 @@ def detect_captcha_type(page, logger=None):
         return "unknown"
 
 # ---------------- 验证码核心处理 ----------------
+def wait_for_grid_images_loaded(page, logger=None, timeout_ms=8000):
+    """等待九宫格图片真正加载完成，避免截到空白/过渡态画面
+
+    geetest 的九宫格在弹层出现后还会异步加载图片并做淡入动画，
+    过早截图会让视觉模型只看到空白格，是此前"识别为空->刷新"死循环的根因。
+    """
+    deadline = time.time() + timeout_ms / 1000.0
+    last_state = None
+    stable_rounds = 0
+
+    while time.time() < deadline:
+        try:
+            state = page.evaluate(
+                """() => {
+                    const box = document.querySelector('.geetest_table_box');
+                    if (!box) return null;
+                    const imgs = Array.from(box.querySelectorAll('img'));
+                    const bgs = Array.from(box.querySelectorAll('*'))
+                        .map(el => getComputedStyle(el).backgroundImage)
+                        .filter(v => v && v !== 'none');
+                    const opacity = parseFloat(getComputedStyle(box).opacity || '1');
+                    return {
+                        total: imgs.length,
+                        complete: imgs.filter(i => i.complete && i.naturalWidth > 0).length,
+                        bgCount: bgs.length,
+                        opacity: opacity,
+                    };
+                }"""
+            )
+        except Exception:
+            state = None
+
+        if state:
+            has_content = (state["total"] > 0 and state["complete"] >= state["total"]) or state["bgCount"] > 0
+            fully_visible = state["opacity"] >= 0.95
+
+            if has_content and fully_visible:
+                signature = (state["total"], state["complete"], state["bgCount"])
+                if signature == last_state:
+                    stable_rounds += 1
+                else:
+                    stable_rounds = 1
+                    last_state = signature
+
+                # 连续两轮状态一致，认为渲染稳定
+                if stable_rounds >= 2:
+                    if logger:
+                        logger.log_debug(f"九宫格图片加载完成: {state}")
+                    page.wait_for_timeout(300)
+                    return True
+            else:
+                stable_rounds = 0
+                last_state = None
+
+        page.wait_for_timeout(400)
+
+    if logger:
+        logger.log_debug("等待九宫格图片加载超时，使用当前画面继续")
+    return False
+
+
+def refresh_grid_captcha(page, logger=None):
+    """刷新九宫格验证码并等待新图加载"""
+    try:
+        refresh_btn = page.locator(".geetest_refresh").first
+        if refresh_btn.is_visible(timeout=1500):
+            refresh_btn.click()
+            page.wait_for_timeout(1200)
+            wait_for_grid_images_loaded(page, logger=logger)
+            return True
+    except Exception as e:
+        print(f"[ERROR] 刷新验证码失败: {e}")
+        if logger:
+            logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
+    return False
+
+
+def normalize_click_indices(raw_indices):
+    """把模型返回的编号列表清洗为有序、去重、合法（1-9）的整数列表"""
+    if not isinstance(raw_indices, (list, tuple)):
+        return []
+
+    cleaned = []
+    for item in raw_indices:
+        try:
+            if isinstance(item, bool):
+                continue
+            if isinstance(item, str):
+                match = re.search(r'\d+', item)
+                if not match:
+                    continue
+                val = int(match.group())
+            else:
+                val = int(item)
+        except Exception:
+            continue
+
+        if 1 <= val <= 9 and val not in cleaned:
+            cleaned.append(val)
+
+    # 全选 9 格几乎必然是模型失控，直接丢弃
+    if len(cleaned) >= 9:
+        return []
+    return cleaned
+
+
+def match_cells_by_name(target, descriptions):
+    """名称包含匹配兜底：目标与格子描述互为子串即视为命中"""
+    if not target:
+        return []
+
+    hits = []
+    for i, desc in enumerate(descriptions, start=1):
+        name = (desc or "").strip()
+        if not name or name in ("空白", "空", "未知"):
+            continue
+        if target in name or name in target:
+            hits.append(i)
+    return hits
+
+
+def crop_grid_cells(grid_img):
+    """把九宫格整图切成 9 个格子（按序号 1-9），并去掉格子边框噪声"""
+    w, h = grid_img.size
+    cell_w, cell_h = w / 3.0, h / 3.0
+    inset_x, inset_y = cell_w * 0.06, cell_h * 0.06
+
+    cells = []
+    for r in range(3):
+        for c in range(3):
+            left = c * cell_w + inset_x
+            top = r * cell_h + inset_y
+            right = (c + 1) * cell_w - inset_x
+            bottom = (r + 1) * cell_h - inset_y
+            cell = grid_img.crop((int(left), int(top), int(right), int(bottom)))
+
+            buf = io.BytesIO()
+            cell.save(buf, format='PNG')
+            cells.append(buf.getvalue())
+    return cells
+
+
 def solve_geetest_multistep(page, ai_service, logger=None):
     """使用AI服务处理九宫格验证码"""
     print("[INFO] 开始处理九宫格验证码...")
     if logger:
         logger.log_captcha_step("开始", "初始化验证码处理")
-    
+
     img_container = page.locator(".geetest_table_box").first
     container_visible = False
     try:
         container_visible = img_container.is_visible(timeout=3000)
     except:
         pass
-    
+
     if not container_visible:
         print("[DEBUG] 验证码容器不可见")
         if logger:
             logger.log_element_status("验证码容器", False)
         return False
-    
+
     if logger:
         logger.log_element_status("验证码容器", True)
-        
+
+    # 关键前置：等待图片加载完成再截图
+    wait_for_grid_images_loaded(page, logger=logger)
+
     # 步骤 1: 识别题目
     target_object = ""
     tip_img = page.locator(".geetest_tip_img").first
@@ -626,15 +813,15 @@ def solve_geetest_multistep(page, ai_service, logger=None):
         tip_img_visible = tip_img.is_visible(timeout=2000)
     except:
         pass
-    
+
     if tip_img_visible:
         print("[DEBUG] 检测到图片提示，使用AI识别...")
         if logger:
             logger.log_captcha_step("步骤1", "检测到图片提示，使用AI识别")
         try:
             tip_img_bytes = capture_locator_screenshot(tip_img, logger=logger, name="题目提示图")
-            target_object = ai_service.call_vision(tip_img_bytes, "图中是什么物体？只回答物体名称，不要带标点。")
-            print(f"[DEBUG] AI识别结果（原始）: {target_object}")
+            target_object = ai_service.recognize_tip_object(tip_img_bytes)
+            print(f"[DEBUG] AI识别题目: {target_object}")
         except Exception as e:
             print(f"[ERROR] AI识别图片提示失败: {e}")
             if logger:
@@ -663,79 +850,95 @@ def solve_geetest_multistep(page, ai_service, logger=None):
             if logger:
                 logger.log_captcha_step("步骤1", "未找到题目提示")
     
-    target_object = re.sub(r'[^\w]', '', target_object) # 过滤掉标点
     print(f">>> [Step 1] 识别题目为：【{target_object}】")
     if logger:
         logger.log_captcha_step("步骤1完成", f"识别题目: {target_object}")
 
-    # 步骤 2-4: 逐行抠图识别
-    print("[DEBUG] 开始逐行识别九宫格...")
-    if logger:
-        logger.log_captcha_step("步骤2-4", "开始逐行识别九宫格")
-    
-    all_descriptions = []
+    if not target_object:
+        print("[WARNING] 题目识别为空，刷新验证码重试")
+        if logger:
+            logger.log_captcha_step("步骤1", "题目识别为空，刷新验证码")
+        refresh_grid_captcha(page, logger)
+        return False
+
+    # 步骤 2: 截取九宫格整图
     try:
-        # 获取整个九宫格的截图并在内存中处理
         grid_bytes = capture_locator_screenshot(img_container, logger=logger, name="九宫格")
         grid_img = Image.open(io.BytesIO(grid_bytes))
         w, h = grid_img.size
-        row_h = h / 3
-        print(f"[DEBUG] 九宫格尺寸: {w}x{h}, 每行高度: {row_h}")
+        print(f"[DEBUG] 九宫格尺寸: {w}x{h}")
         if logger:
-            logger.log_captcha_step("步骤2-4", f"九宫格尺寸: {w}x{h}")
-        
-        for i in range(3):
-            print(f"[DEBUG] 正在识别第 {i+1} 行...")
-            if logger:
-                logger.log_captcha_step(f"步骤{i+2}", f"识别第 {i+1} 行")
-            
-            # 裁剪出每一行
-            top = i * row_h
-            bottom = (i + 1) * row_h
-            row_crop = grid_img.crop((0, top, w, bottom))
-            
-            buf = io.BytesIO()
-            row_crop.save(buf, format='PNG')
-            row_res = ai_service.identify_captcha_row(buf.getvalue(), i+1)
-            print(f"[DEBUG] 第 {i+1} 行识别结果: {row_res}")
-            if logger:
-                logger.log_captcha_step(f"步骤{i+2}完成", f"第 {i+1} 行: {row_res}")
-            all_descriptions.extend(row_res)
+            logger.log_captcha_step("步骤2", f"九宫格尺寸: {w}x{h}")
     except Exception as e:
-        print(f"[ERROR] 九宫格识别过程出错: {e}")
+        print(f"[ERROR] 九宫格截图失败: {e}")
         if logger:
             logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
         return False
 
-    # 步骤 5: 语义匹配并模拟点击
-    print(f"[DEBUG] 开始语义匹配，目标: {target_object}, 描述列表: {all_descriptions}")
-    if logger:
-        logger.log_captcha_step("步骤5", f"语义匹配 - 目标: {target_object}")
-    
+    # 步骤 3: 整图直选（一次调用即可拿到答案，最省时也最准）
+    click_indices = []
     try:
-        click_indices = ai_service.semantic_match(target_object, all_descriptions)
-        print(f">>> [Final] 最终决定点击序号: {click_indices}")
+        click_indices = ai_service.select_matching_cells(target_object, grid_bytes)
+        click_indices = normalize_click_indices(click_indices)
+        print(f"[DEBUG] 整图直选结果: {click_indices}")
         if logger:
-            logger.log_captcha_step("步骤5完成", f"匹配结果: {click_indices}")
+            logger.log_captcha_step("步骤3", f"整图直选结果: {click_indices}")
     except Exception as e:
-        print(f"[ERROR] 语义匹配失败: {e}")
+        print(f"[WARNING] 整图直选失败，回退逐格识别: {e}")
         if logger:
-            logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
-        return False
-    
+            logger.log_debug(f"整图直选失败，回退逐格识别: {e}")
+
+    # 步骤 4: 回退方案——逐格识别 + 语义裁决
+    if not click_indices:
+        print("[DEBUG] 整图直选未命中，开始逐格识别...")
+        if logger:
+            logger.log_captcha_step("步骤4", "整图直选未命中，开始逐格识别")
+        try:
+            cells = crop_grid_cells(grid_img)
+            descriptions = ai_service.describe_cells(cells)
+            print(f"[DEBUG] 逐格识别结果: {descriptions}")
+            if logger:
+                logger.log_captcha_step("步骤4完成", f"逐格识别结果: {descriptions}")
+
+            meaningful = [d for d in descriptions if d not in ("空白", "空", "未知", "")]
+            if not meaningful:
+                print("[WARNING] 逐格识别全为空白，判定为截图时机异常，刷新验证码")
+                if logger:
+                    logger.log_captcha_step("步骤4", "逐格识别全为空白，刷新验证码")
+                refresh_grid_captcha(page, logger)
+                return False
+
+            click_indices = normalize_click_indices(
+                ai_service.semantic_match(target_object, descriptions)
+            )
+            print(f"[DEBUG] 语义裁决结果: {click_indices}")
+            if logger:
+                logger.log_captcha_step("步骤4完成", f"语义裁决结果: {click_indices}")
+
+            # 兜底：语义裁决没给结果时，直接做名称包含匹配
+            if not click_indices:
+                click_indices = normalize_click_indices(
+                    match_cells_by_name(target_object, descriptions)
+                )
+                if click_indices:
+                    print(f"[DEBUG] 名称包含匹配兜底结果: {click_indices}")
+                    if logger:
+                        logger.log_captcha_step("步骤4", f"名称包含匹配兜底: {click_indices}")
+        except Exception as e:
+            print(f"[ERROR] 逐格识别过程出错: {e}")
+            if logger:
+                logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
+            return False
+
+    print(f">>> [Final] 最终决定点击序号: {click_indices}")
+    if logger:
+        logger.log_captcha_step("最终决策", f"点击序号: {click_indices}")
+
     if not click_indices:
         print("[INFO] 未找到匹配项，刷新验证码...")
         if logger:
-            logger.log_captcha_step("步骤5", "未找到匹配项，刷新验证码")
-        try:
-            refresh_btn = page.locator(".geetest_refresh").first
-            if refresh_btn.is_visible():
-                refresh_btn.click()
-                time.sleep(2)
-        except Exception as e:
-            print(f"[ERROR] 刷新验证码失败: {e}")
-            if logger:
-                logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
+            logger.log_captcha_step("最终决策", "未找到匹配项，刷新验证码")
+        refresh_grid_captcha(page, logger)
         return False
 
     try:
@@ -747,29 +950,32 @@ def solve_geetest_multistep(page, ai_service, logger=None):
             logger.log_captcha_step("点击", f"容器位置: ({box['x']}, {box['y']}), 格子尺寸: {cell_w}x{cell_h}")
         
         click_count = 0
-        for idx in click_indices:
+        for val in click_indices:
             try:
-                val = int(idx)
-                if 1 <= val <= 9:
-                    r, c = (val-1)//3, (val-1)%3
-                    # 点击格子的中心点
-                    target_x = box['x'] + c*cell_w + cell_w/2
-                    target_y = box['y'] + r*cell_h + cell_h/2
-                    print(f"[DEBUG] 点击格子 {val} (行{r+1}, 列{c+1}), 坐标: ({target_x}, {target_y})")
-                    if logger:
-                        logger.log_captcha_step("点击", f"格子 {val} (行{r+1}, 列{c+1})")
-                    page.mouse.click(target_x, target_y)
-                    click_count += 1
-                    time.sleep(random.uniform(0.3, 0.5))
+                r, c = (val - 1) // 3, (val - 1) % 3
+                # 点击格子中心附近的随机点，避免每次都精确命中中心
+                target_x = box['x'] + c * cell_w + cell_w / 2 + random.uniform(-cell_w * 0.12, cell_w * 0.12)
+                target_y = box['y'] + r * cell_h + cell_h / 2 + random.uniform(-cell_h * 0.12, cell_h * 0.12)
+                print(f"[DEBUG] 点击格子 {val} (行{r+1}, 列{c+1}), 坐标: ({target_x:.1f}, {target_y:.1f})")
+                if logger:
+                    logger.log_captcha_step("点击", f"格子 {val} (行{r+1}, 列{c+1})")
+                page.mouse.click(target_x, target_y)
+                click_count += 1
+                time.sleep(random.uniform(0.3, 0.6))
             except Exception as e:
-                print(f"[ERROR] 点击格子 {idx} 失败: {e}")
+                print(f"[ERROR] 点击格子 {val} 失败: {e}")
                 if logger:
                     logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
                 continue
-        
+
         print(f"[DEBUG] 共点击了 {click_count} 个格子")
         if logger:
             logger.log_captcha_step("点击完成", f"共点击 {click_count} 个格子")
+
+        if click_count == 0:
+            print("[WARNING] 没有成功点击任何格子，刷新验证码")
+            refresh_grid_captcha(page, logger)
+            return False
     except Exception as e:
         print(f"[ERROR] 获取验证码容器位置失败: {e}")
         if logger:
@@ -800,7 +1006,22 @@ def solve_geetest_multistep(page, ai_service, logger=None):
         if logger:
             logger.log_captcha_step("提交", "未找到提交按钮")
         return False
-    
+
+    # 提交后确认结果：验证失败时立即刷新，避免下一轮对着旧题重复识别
+    page.wait_for_timeout(1800)
+    try:
+        body_text = page.locator("body").inner_text(timeout=1500)
+    except Exception:
+        body_text = ""
+
+    failure_hints = ["验证失败", "怪物太狡猾", "再试一次", "请再试一次"]
+    if any(hint in body_text for hint in failure_hints):
+        print("[INFO] 验证码校验未通过，刷新后重试")
+        if logger:
+            logger.log_captcha_step("提交", "验证码校验未通过，刷新后重试")
+        refresh_grid_captcha(page, logger)
+        return False
+
     print("[DEBUG] 验证码处理完成")
     if logger:
         logger.log_captcha_step("完成", "验证码处理完成")
@@ -1426,7 +1647,7 @@ def main():
 
     with sync_playwright() as p:
         # 默认不复用 state.json，避免历史会话导致账号或签到状态错读
-        use_state_cache = os.getenv("USE_STATE_CACHE", "false").strip().lower() in ("1", "true", "yes", "on")
+        use_state_cache = env_flag("USE_STATE_CACHE")
 
         # 从环境变量读取代理配置（可选）
         proxy_url = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
@@ -1760,7 +1981,7 @@ def main():
                     # 额外重试轮（默认开启，仅在验证码场景生效）
                     extra_attempts = 0
                     if captcha_appeared:
-                        extra_enabled = os.getenv("CAPTCHA_EXTRA_ROUND_ENABLED", "true").strip().lower() in ("1", "true", "yes", "on")
+                        extra_enabled = env_flag("CAPTCHA_EXTRA_ROUND_ENABLED", "true")
                         if extra_enabled:
                             try:
                                 extra_attempts = max(0, int(os.getenv("CAPTCHA_EXTRA_ROUND_ATTEMPTS", "2").strip()))
@@ -1989,20 +2210,36 @@ def main():
                     if logger:
                         logger.log_error(f"截图保存失败（不影响主流程）: {e}")
 
-        # 邮件通知（成功发送成功邮件；最终失败可发送失败邮件）
+        # 邮件通知：按策略决定是否打扰
+        policy = get_notify_policy()
         if final_success:
             run_success = True
-            send_success_email(
-                logger,
-                before_traffic_bytes=before_traffic_bytes,
-                reward_traffic_bytes=reward_traffic_bytes,
-                after_traffic_bytes=after_traffic_bytes,
-                account_name=username,
-            )
+            newly_signed = not was_already_signed
+
+            if policy == "all":
+                should_notify = True
+            elif policy == "change":
+                should_notify = newly_signed
+            else:
+                # none / failure_only：成功不发邮件
+                should_notify = False
+
+            if should_notify:
+                send_success_email(
+                    logger,
+                    before_traffic_bytes=before_traffic_bytes,
+                    reward_traffic_bytes=reward_traffic_bytes,
+                    after_traffic_bytes=after_traffic_bytes,
+                    account_name=username,
+                )
+            elif logger:
+                logger.log_debug(f"邮件策略 {policy}：签到成功不发送通知（新签到={newly_signed}）")
         else:
-            suppress_fail_email = os.getenv("SUPPRESS_FAIL_EMAIL", "false").strip().lower() in ("1", "true", "yes", "on")
+            suppress_fail_email = env_flag("SUPPRESS_FAIL_EMAIL")
             if not suppress_fail_email:
                 send_failure_email(failure_reason, logger=logger, account_name=username)
+            elif logger:
+                logger.log_debug("中间轮次失败，按配置抑制失败邮件")
 
         update_failure_alert_state(run_success, failure_reason, logger)
         
