@@ -15,6 +15,13 @@ from PIL import Image
 from playwright.sync_api import sync_playwright
 from ai_service import AIService
 from logger import CheckinLogger
+from runtime_policy import (
+    credentials_from_environment,
+    exit_code_for_result,
+    get_notify_policy as resolve_notify_policy,
+    requires_manual_verification,
+    should_notify_success,
+)
 import pytweening  # 用于缓动函数（无GUI依赖）
 
 # 加载环境变量
@@ -44,6 +51,12 @@ def load_file_content(path: Path):
     return path.read_text(encoding="utf-8").strip()
 
 def load_username_password(path: Path):
+    env_credentials = credentials_from_environment(
+        os.getenv("SAKURA_USERNAME"), os.getenv("SAKURA_PASSWORD")
+    )
+    if env_credentials is not None:
+        return env_credentials
+
     content = load_file_content(path)
     lines = [l.strip() for l in content.splitlines() if l.strip()]
     if len(lines) < 2:
@@ -199,17 +212,46 @@ def env_flag(name, default="false"):
 
 
 def get_notify_policy():
-    """邮件通知策略
+    """邮件通知策略；默认每次运行都报告签到状态。"""
+    return resolve_notify_policy(os.getenv("EMAIL_NOTIFY_POLICY"))
 
-    - none:         从不发送
-    - failure_only: 仅最终失败时发送（默认，日常成功不打扰）
-    - change:       最终失败 + 本次新签到成功（跳过"今日已签到"这类无变化场景）
-    - all:          每次运行都发送（旧行为）
-    """
-    policy = os.getenv("EMAIL_NOTIFY_POLICY", "failure_only").strip().lower()
-    if policy not in ("none", "failure_only", "change", "all"):
-        policy = "failure_only"
-    return policy
+
+def notify_failure_email(reason, logger=None, manual_verification_required=False):
+    """Send the terminal failure notice unless this is a retryable attempt."""
+    if env_flag("SUPPRESS_FAIL_EMAIL") and not manual_verification_required:
+        if logger:
+            logger.log_debug("中间轮次失败，按配置抑制失败邮件")
+        return False
+    return send_failure_email(reason, logger=logger)
+
+
+def require_manual_captcha(captcha_type, logger=None):
+    """Return a clear manual action reason for an interactive CAPTCHA."""
+    if not requires_manual_verification(captcha_type):
+        return None
+    reason = "检测到图片验证码，已停止自动处理；请按 SakuraFrp 页面提示人工完成验证。"
+    print(f"[WARNING] {reason}")
+    if logger:
+        logger.log_captcha_result("需要人工验证；未尝试自动解题或提交")
+        logger.log_error(reason)
+    return reason
+
+
+def resolve_failure_reason(
+    final_success,
+    manual_verification_required,
+    pending_failure_reason,
+    final_sign_button_visible,
+    default_reason="未知错误",
+):
+    """Keep an explicit manual-verification result ahead of generic UI checks."""
+    if final_success:
+        return ""
+    if manual_verification_required and pending_failure_reason:
+        return pending_failure_reason
+    if final_sign_button_visible:
+        return "最终校验失败：签到按钮仍可见（判定为未签到）"
+    return pending_failure_reason or default_reason
 
 
 # 单次运行只允许发出一封邮件，避免"失败邮件 + 告警邮件"重复轰炸
@@ -395,7 +437,6 @@ def send_success_email(
     before_traffic_bytes=None,
     reward_traffic_bytes=None,
     after_traffic_bytes=None,
-    account_name="unknown",
 ):
     """签到成功（含已签到）后发送邮件通知"""
     subject = f"SakuraFRP 签到成功通知 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
@@ -407,7 +448,6 @@ def send_success_email(
     log_file_path = str(logger.log_file) if logger and getattr(logger, "log_file", None) else str(BASE_DIR / "logs")
     contents = (
         f"签到任务执行成功（包括“今日已签到”状态）。\n\n"
-        f"账号：{account_name}\n"
         f"签到前剩余流量：{before_text}\n"
         f"本次签到获得流量：{reward_text}\n"
         f"签到后剩余流量：{after_text}\n\n"
@@ -419,7 +459,7 @@ def send_success_email(
 
     send_email_notification(subject, contents, logger=logger)
 
-def send_failure_email(reason, logger=None, account_name="unknown"):
+def send_failure_email(reason, logger=None):
     """最终失败后发送邮件通知"""
     subject = f"[失败] SakuraFRP 签到失败通知 - {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
     host_name = os.uname().nodename if hasattr(os, "uname") else "unknown"
@@ -434,7 +474,6 @@ def send_failure_email(reason, logger=None, account_name="unknown"):
 
     contents = (
         f"SakuraFRP 自动签到最终失败。\n\n"
-        f"账号：{account_name}\n"
         f"失败原因：{reason or '未知'}\n"
         f"{attempt_text}"
         f"时间：{datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n"
@@ -1594,6 +1633,7 @@ def dismiss_adult_popup(page, logger=None):
 def main():
     run_success = False
     failure_reason = "未知错误"
+    manual_verification_required = False
 
     # 解析命令行参数
     parser = argparse.ArgumentParser(description='SakuraFRP自动签到脚本')
@@ -1631,6 +1671,7 @@ def main():
         print(f"[ERROR] {error_msg}")
         if logger:
             logger.log_error(error_msg)
+        notify_failure_email(error_msg, logger=logger)
         update_failure_alert_state(False, error_msg, logger)
         return 1
     
@@ -1642,6 +1683,7 @@ def main():
         print(f"[ERROR] {error_msg}")
         if logger:
             logger.log_error(error_msg)
+        notify_failure_email(error_msg, logger=logger)
         update_failure_alert_state(False, error_msg, logger)
         return 1
 
@@ -1653,9 +1695,9 @@ def main():
         proxy_url = os.getenv("HTTP_PROXY") or os.getenv("http_proxy")
         
         if proxy_url:
-            print(f"[INFO] 使用代理: {proxy_url}")
+            print("[INFO] 已配置代理")
             if logger:
-                logger.log_info(f"使用代理: {proxy_url}")
+                logger.log_info("已配置代理（地址已隐藏）")
             browser = p.chromium.launch(
                 headless=True, 
                 slow_mo=100,
@@ -1698,6 +1740,7 @@ def main():
             print(f"[ERROR] {error_msg}")
             if logger:
                 logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
+            notify_failure_email(error_msg, logger=logger)
             update_failure_alert_state(False, error_msg, logger)
             browser.close()
             return 1
@@ -1802,6 +1845,7 @@ def main():
                 print(f"[ERROR] {error_msg}")
                 if logger:
                     logger.log_exception(type(e).__name__, str(e), traceback.format_exc())
+                notify_failure_email(error_msg, logger=logger)
                 update_failure_alert_state(False, error_msg, logger)
                 browser.close()
                 return 1
@@ -2025,14 +2069,15 @@ def main():
                             print(f"[DEBUG] 第 {attempt} 次检查：检测到{('九宫格' if captcha_type == 'grid' else '滑块')}验证码")
                             if logger:
                                 logger.log_captcha_step(f"第 {attempt} 次", f"检测到{('九宫格' if captcha_type == 'grid' else '滑块')}验证码")
+
+                            manual_reason = require_manual_captcha(captcha_type, logger=logger)
+                            if manual_reason:
+                                manual_verification_required = True
+                                pending_failure_reason = manual_reason
+                                break
                             
                             try:
-                                if captcha_type == "grid":
-                                    captcha_result = solve_geetest_multistep(page, ai_service, logger)
-                                elif captcha_type == "slider":
-                                    captcha_result = solve_geetest_slider(page, ai_service, logger)
-                                else:
-                                    captcha_result = False
+                                captcha_result = False
                                 
                                 result_text = "成功" if captcha_result else "失败"
                                 print(f"[DEBUG] 验证码处理结果: {result_text}")
@@ -2067,10 +2112,14 @@ def main():
                     
                     if not sign_success:
                         final_url = page.url
-                        error_msg = f"签到失败：超时或验证码处理失败（已尝试 {max_attempts} 次）"
-                        pending_failure_reason = error_msg
+                        if not manual_verification_required:
+                            error_msg = f"签到失败：超时或验证码处理失败（已尝试 {max_attempts} 次）"
+                            pending_failure_reason = error_msg
                         if logger:
-                            logger.log_wait_timeout("签到循环", max_attempts, max_attempts)
+                            if manual_verification_required:
+                                logger.log_info(f"验证码需要人工处理，已在第 {attempt}/{max_attempts} 次检查时停止")
+                            else:
+                                logger.log_wait_timeout("签到循环", max_attempts, max_attempts)
                             logger.log_page_url(final_url)
             else:
                 current_url_final = page.url
@@ -2095,7 +2144,7 @@ def main():
         final_completed = sign_success or (success_loc is not None) or is_checkin_completed(page, logger)
 
         # 最终失败前刷新一次页面再复核，避免状态延迟
-        if not final_completed:
+        if not final_completed and not manual_verification_required:
             try:
                 page.reload(wait_until="domcontentloaded", timeout=45000)
                 page.wait_for_timeout(1200)
@@ -2110,18 +2159,20 @@ def main():
         final_sign_button_visible = is_sign_button_visible(page, timeout=1200)
         final_success = (was_already_signed or final_completed) and (not final_sign_button_visible)
 
-        if not final_success and final_sign_button_visible:
-            failure_reason = "最终校验失败：签到按钮仍可见（判定为未签到）"
+        failure_reason = resolve_failure_reason(
+            final_success,
+            manual_verification_required,
+            pending_failure_reason,
+            final_sign_button_visible,
+            default_reason=failure_reason,
+        )
+        if not final_success:
             print(f"[ERROR] {failure_reason}")
             if logger:
-                logger.log_error(failure_reason)
-        elif not final_success and pending_failure_reason:
-            failure_reason = pending_failure_reason
-            print(f"[ERROR] {failure_reason}")
-            if logger:
-                logger.log_sign_failed(failure_reason)
-        elif final_success:
-            failure_reason = ""
+                if manual_verification_required or pending_failure_reason:
+                    logger.log_sign_failed(failure_reason)
+                else:
+                    logger.log_error(failure_reason)
         if final_success:
             newly_signed_success = not was_already_signed
             parsed_after_traffic_bytes = get_remaining_traffic_bytes(page, logger)
@@ -2216,13 +2267,7 @@ def main():
             run_success = True
             newly_signed = not was_already_signed
 
-            if policy == "all":
-                should_notify = True
-            elif policy == "change":
-                should_notify = newly_signed
-            else:
-                # none / failure_only：成功不发邮件
-                should_notify = False
+            should_notify = should_notify_success(policy, newly_signed)
 
             if should_notify:
                 send_success_email(
@@ -2230,23 +2275,22 @@ def main():
                     before_traffic_bytes=before_traffic_bytes,
                     reward_traffic_bytes=reward_traffic_bytes,
                     after_traffic_bytes=after_traffic_bytes,
-                    account_name=username,
                 )
             elif logger:
                 logger.log_debug(f"邮件策略 {policy}：签到成功不发送通知（新签到={newly_signed}）")
         else:
-            suppress_fail_email = env_flag("SUPPRESS_FAIL_EMAIL")
-            if not suppress_fail_email:
-                send_failure_email(failure_reason, logger=logger, account_name=username)
-            elif logger:
-                logger.log_debug("中间轮次失败，按配置抑制失败邮件")
+            notify_failure_email(
+                failure_reason,
+                logger=logger,
+                manual_verification_required=manual_verification_required,
+            )
 
         update_failure_alert_state(run_success, failure_reason, logger)
         
         print("[INFO] 脚本运行结束。")
         browser.close()
 
-        return 0 if run_success else 1
+        return exit_code_for_result(run_success, manual_verification_required)
 
 if __name__ == "__main__":
     sys.exit(main())
