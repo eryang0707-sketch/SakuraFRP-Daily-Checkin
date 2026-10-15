@@ -20,7 +20,7 @@
 稳定版 SakuraFRP 自动签到脚本，支持：
 
 - Playwright 自动化登录与签到
-- 九宫格/滑块验证码处理
+- 验证码检测；需要交互验证时安全停止并记录
 - 单次执行内多轮重试
 - 成功/失败邮件通知
 - 本地运行 + GitHub Actions 每日定时运行
@@ -36,7 +36,7 @@
 - 严格签到成功判定，避免误报
 - 登录状态二次确认与自动补登录
 - 18+ 弹窗自动处理
-- 验证码失败自动重试
+- 网络或程序错误可重试；验证码出现时停止重试并提示人工处理
 - 失败退出码正确返回，便于调度层重试
 
 ## 2. 项目结构
@@ -95,33 +95,24 @@ python main.py --both
 - `ZHIPU_MODEL_VISION`: 视觉模型（默认 `glm-4.6v-flash`）
 - `ZHIPU_MODEL_TEXT`: 文本模型（默认 `glm-4.7-flash`）
 - `AI_CALL_MAX_RETRIES`: AI 调用失败重试次数
-- `AI_CELL_WORKERS`: 九宫格逐格识别并发数（建议 2-4）
 - `USE_STATE_CACHE`: 是否复用 state 登录态（推荐 `false`）
-- `CAPTCHA_EXTRA_ROUND_ENABLED`: 验证码额外重试开关
-- `CAPTCHA_EXTRA_ROUND_ATTEMPTS`: 验证码额外重试次数
 - `CHECKIN_MAX_RETRIES`: 外层重试次数（建议 5）
 - `CHECKIN_RETRY_INTERVAL_SECONDS`: 外层重试间隔秒数（建议 30）
 
-### 4.1 验证码识别策略
+### 4.1 验证码检测与处理
 
-九宫格识别按以下顺序推进，任一步命中即提交：
-
-1. 等待格子图片真正加载完成（`img.complete` + 容器不透明度稳定）后再截图
-2. 整图直选：把完整九宫格交给视觉模型，一次返回命中编号
-3. 回退逐格识别：切成 9 张单格图并发识别，再交文本模型做语义裁决
-4. 兜底名称匹配：目标与格子描述互为子串即命中
-5. 提交后校验，出现“验证失败”文案立即刷新换题，不浪费重试轮次
+脚本会检测已知的九宫格和滑块验证码。检测到后会记录日志、停止本次自动签到并以专用退出码结束；不会调用视觉模型解题、点击答案或提交验证。GitHub-hosted runner 无法进行人工交互，因此这次任务需要你按 SakuraFrp 页面提示手动完成验证。普通网络或程序错误仍按工作流重试。
 
 ### 4.2 邮件通知策略
 
-用 `EMAIL_NOTIFY_POLICY` 控制打扰程度：
+用 `EMAIL_NOTIFY_POLICY` 控制通知频率，默认值为 `all`，每天会收到一次签到状态邮件（新签到或“今日已签到”）：
 
 | 取值 | 行为 |
 | --- | --- |
 | `none` | 从不发邮件 |
-| `failure_only` | **默认**，仅最终失败时发 |
+| `failure_only` | 仅最终失败时发 |
 | `change` | 最终失败 + 当天首次签到成功；“今日已签到”不发 |
-| `all` | 每次运行都发（旧行为） |
+| `all` | **默认**，每次运行都发，包括“今日已签到” |
 
 另外两点：
 
@@ -142,30 +133,35 @@ python main.py --both
 
 GitHub Actions 使用 UTC 时区。
 
-- 目标: 每天北京时间 12:00
-- 对应 cron: `0 4 * * *`
+- 目标: 每天北京时间 12:07
+- 对应 cron: `7 4 * * *`（UTC）
 
 ### 5.2 需要配置的 Secrets
 
-在 GitHub 仓库 `Settings -> Secrets and variables -> Actions` 中添加：
+签到使用的 Secrets（保留现有配置）：
 
 - `SAKURA_USERNAME`
 - `SAKURA_PASSWORD`
 - `ZHIPU_API_KEY`
-- `EMAIL_SMTP_USER`
-- `EMAIL_SMTP_PASSWORD`
-- `EMAIL_TO`
 - `HTTP_PROXY` (可选)
 
-工作流会基于这些 Secrets 动态生成运行时的 `.env` 和 `account.txt`。
+如需邮件通知，在 `Settings -> Secrets and variables -> Actions -> Secrets` 中添加以下邮件 Secrets：
+
+- `EMAIL_SMTP_USER`：SMTP 发件账号
+- `EMAIL_SMTP_PASSWORD`：SMTP 授权码或应用密码
+- `EMAIL_TO`：收件地址；多个地址用逗号分隔
+
+邮件服务器默认使用 `smtp.qq.com`。其他服务商可在 Actions 的 Repository variables 中设置 `EMAIL_SMTP_HOST`。如已设置 `EMAIL_NOTIFY_POLICY` 变量，其值会覆盖工作流的默认 `all`。
+
+工作流通过步骤级环境变量向运行进程提供 Secrets，不会把值插入 shell 脚本或写入 artifact。没有邮件 SMTP 配置时，签到仍会执行，日志会提示邮件未发送。
 
 ### 5.3 首次验证
 
 1. 打开 Actions 页面
 2. 手动运行 `SakuraFRP Daily Check-in`
-3. 检查 Job 日志
-4. 下载 artifacts 查看 `logs/` 与截图
-5. 确认邮件通知是否正常
+3. 检查 Job 日志和 secret-free 验证任务
+4. 下载 artifacts 查看 `logs/`
+5. 配好 SMTP Secrets 后确认是否收到邮件；手动运行成功只能验证当次登录/签到结果，不能证明视觉 API 或验证码处理有效
 
 ## 6. 安全建议
 
@@ -175,15 +171,15 @@ GitHub Actions 使用 UTC 时区。
 
 ## 7. 故障排查
 
-### 7.1 验证码连续失败
+### 7.1 需要人工完成验证码
 
-- 增大 `CHECKIN_MAX_RETRIES`
-- 增大 `CAPTCHA_EXTRA_ROUND_ATTEMPTS`
-- 检查网络代理连通性
+- 查看邮件/Actions 日志确认已检测到验证码
+- 按 SakuraFrp 页面提示人工完成验证；脚本不会自动识别或提交
 
 ### 7.2 邮件未收到
 
 - 检查 SMTP 授权码是否有效
+- 检查 `EMAIL_SMTP_USER`、`EMAIL_SMTP_PASSWORD`、`EMAIL_TO` 是否已配置
 - 检查邮箱垃圾箱
 - 查看日志中 `邮件发送失败` 报错
 
