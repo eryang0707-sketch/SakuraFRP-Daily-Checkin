@@ -3,27 +3,55 @@ name: SakuraFRP Daily Check-in
 on:
   schedule:
     # 12:07 Asia/Shanghai == 04:07 UTC
-    # 避开整点可显著降低 GitHub schedule 延迟/丢触发概率
+    # Avoiding the top of the hour reduces GitHub schedule contention.
     - cron: '7 4 * * *'
   workflow_dispatch:
+  pull_request:
+    branches: [main]
+
+permissions:
+  contents: read
 
 concurrency:
   group: sakurafrp-daily-checkin
   cancel-in-progress: false
 
 jobs:
+  validate:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 10
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v7
+
+      - name: Setup Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.11'
+
+      - name: Run secret-free policy tests
+        run: python -m unittest discover -s tests -v
+
+      - name: Compile Python sources
+        run: python -m compileall -q main.py ai_service.py logger.py runtime_policy.py test.py
+
+      - name: Check shell syntax
+        run: bash -n run_checkin.sh run_scheduled.sh generate_random_time.sh
+
   checkin:
-    runs-on: ubuntu-latest
+    if: github.event_name != 'pull_request'
+    needs: validate
+    runs-on: ubuntu-24.04
     timeout-minutes: 40
     env:
       TZ: Asia/Shanghai
 
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
       - name: Setup Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.11'
           cache: 'pip'
@@ -34,45 +62,36 @@ jobs:
           pip install -r requirements.txt
           python -m playwright install --with-deps chromium
 
-      - name: Prepare Runtime Config
-        shell: bash
-        run: |
-          cat > account.txt <<EOF
-          ${{ secrets.SAKURA_USERNAME }}
-          ${{ secrets.SAKURA_PASSWORD }}
-          EOF
-
-          cat > .env <<EOF
-          ZHIPU_API_KEY=${{ secrets.ZHIPU_API_KEY }}
-          ZHIPU_MODEL_VISION=glm-4.6v-flash
-          ZHIPU_MODEL_TEXT=glm-4.7-flash
-          SCHEDULE_TIME=12:00
-          HTTP_PROXY=${{ secrets.HTTP_PROXY }}
-          USE_STATE_CACHE=false
-          EMAIL_NOTIFY_ENABLED=true
-          EMAIL_NOTIFY_POLICY=${{ vars.EMAIL_NOTIFY_POLICY || 'failure_only' }}
-          EMAIL_SMTP_HOST=smtp.qq.com
-          EMAIL_SMTP_USER=${{ secrets.EMAIL_SMTP_USER }}
-          EMAIL_SMTP_PASSWORD=${{ secrets.EMAIL_SMTP_PASSWORD }}
-          EMAIL_TO=${{ secrets.EMAIL_TO }}
-          FAIL_ALERT_ENABLED=false
-          FAIL_ALERT_THRESHOLD=2
-          CAPTCHA_EXTRA_ROUND_ENABLED=true
-          CAPTCHA_EXTRA_ROUND_ATTEMPTS=3
-          AI_CALL_MAX_RETRIES=2
-          AI_CELL_WORKERS=3
-          CHECKIN_MAX_RETRIES=5
-          CHECKIN_RETRY_INTERVAL_SECONDS=30
-          EOF
-
       - name: Run Check-in With Retries
         shell: bash
+        env:
+          SAKURA_USERNAME: ${{ secrets.SAKURA_USERNAME }}
+          SAKURA_PASSWORD: ${{ secrets.SAKURA_PASSWORD }}
+          ZHIPU_API_KEY: ${{ secrets.ZHIPU_API_KEY }}
+          ZHIPU_MODEL_VISION: glm-4.6v-flash
+          ZHIPU_MODEL_TEXT: glm-4.7-flash
+          SCHEDULE_TIME: '12:07'
+          HTTP_PROXY: ${{ secrets.HTTP_PROXY }}
+          USE_STATE_CACHE: 'false'
+          EMAIL_NOTIFY_ENABLED: 'true'
+          EMAIL_NOTIFY_POLICY: ${{ vars.EMAIL_NOTIFY_POLICY || 'all' }}
+          EMAIL_SMTP_HOST: ${{ vars.EMAIL_SMTP_HOST || 'smtp.qq.com' }}
+          EMAIL_SMTP_USER: ${{ secrets.EMAIL_SMTP_USER }}
+          EMAIL_SMTP_PASSWORD: ${{ secrets.EMAIL_SMTP_PASSWORD }}
+          EMAIL_TO: ${{ secrets.EMAIL_TO }}
+          FAIL_ALERT_ENABLED: 'false'
+          FAIL_ALERT_THRESHOLD: '2'
+          AI_CALL_MAX_RETRIES: '2'
+          AI_CELL_WORKERS: '3'
+          CHECKIN_MAX_RETRIES: '5'
+          CHECKIN_RETRY_INTERVAL_SECONDS: '30'
         run: |
-          set -e
+          set -euo pipefail
           max_retries=5
           interval=30
           attempt=1
           success=0
+          last_exit_code=1
 
           while [ "$attempt" -le "$max_retries" ]; do
             echo "[INFO] Attempt ${attempt}/${max_retries}"
@@ -88,25 +107,39 @@ jobs:
 
             if python main.py --both; then
               success=1
+              last_exit_code=0
               echo "[INFO] Check-in succeeded on attempt ${attempt}"
+              break
+            else
+              last_exit_code=$?
+            fi
+
+            if [ "$last_exit_code" -eq 2 ]; then
+              echo "[ERROR] Manual SakuraFrp verification is required; skipping further retries."
               break
             fi
 
-            echo "[WARNING] Attempt ${attempt} failed"
+            echo "[WARNING] Attempt ${attempt} failed with exit code ${last_exit_code}"
             if [ "$attempt" -lt "$max_retries" ]; then
               sleep "$interval"
             fi
             attempt=$((attempt + 1))
           done
 
-          if [ "$success" -ne 1 ]; then
-            echo "[ERROR] All attempts failed"
-            exit 1
+          if [ "$success" -eq 1 ]; then
+            exit 0
           fi
+
+          if [ "$last_exit_code" -eq 2 ]; then
+            echo "[ERROR] Check the run log and complete the verification on SakuraFrp."
+          else
+            echo "[ERROR] All retryable check-in attempts failed."
+          fi
+          exit "$last_exit_code"
 
       - name: Upload Logs and Artifacts
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: checkin-artifacts-${{ github.run_id }}
           retention-days: 7
