@@ -140,6 +140,11 @@ if [ "$CURRENT_HOUR" = "$RANDOM_HOUR" ] && [ "$CURRENT_MIN" = "$RANDOM_MIN" ]; t
             break
         fi
 
+        if [ "$EXIT_CODE" -eq 2 ]; then
+            echo "[WARNING] 检测到需要人工完成的验证，停止后续重试"
+            break
+        fi
+
         echo "[WARNING] 第 ${ATTEMPT}/${MAX_RETRIES} 轮签到失败，退出码: $EXIT_CODE"
         if [ "$ATTEMPT" -lt "$MAX_RETRIES" ]; then
             echo "[INFO] ${RETRY_INTERVAL} 秒后重试..."
@@ -151,8 +156,12 @@ if [ "$CURRENT_HOUR" = "$RANDOM_HOUR" ] && [ "$CURRENT_MIN" = "$RANDOM_MIN" ]; t
 
     if [ $EXIT_CODE -eq 0 ]; then
         echo "[INFO] 签到脚本执行完成"
+    elif [ "$EXIT_CODE" -eq 2 ]; then
+        echo "[ERROR] 签到需要人工完成验证，退出码: $EXIT_CODE"
+        # 允许人工完成验证后重新运行脚本
+        rm -f "$LOCK_FILE"
     else
-        echo "[ERROR] 签到脚本执行失败（已重试 ${MAX_RETRIES} 轮），退出码: $EXIT_CODE"
+        echo "[ERROR] 签到脚本执行失败（已尝试 ${MAX_RETRIES} 轮），退出码: $EXIT_CODE"
         # 执行失败时删除锁文件，允许重试
         rm -f "$LOCK_FILE"
     fi
