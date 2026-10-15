@@ -3,12 +3,14 @@
 测试脚本 - 检查项目运行情况
 运行方式: 
   python3 test.py          # 使用系统Python
+  python3 test.py --live-api # 另行调用智谱API（会消耗API额度）
   uv run test.py           # 使用uv虚拟环境（推荐）
   .venv/bin/python test.py # 直接使用虚拟环境Python
 """
 
 import sys
 import os
+import argparse
 from pathlib import Path
 
 # 添加项目根目录到路径
@@ -236,17 +238,13 @@ def test_ai_service():
             
             return True
         except ValueError as e:
-            print_result(False, f"AIService 初始化失败: {e}")
+            print_result(False, f"AIService 初始化失败（{type(e).__name__}）")
             return False
         except Exception as e:
-            print_result(False, f"AIService 初始化异常: {e}")
-            import traceback
-            traceback.print_exc()
+            print_result(False, f"AIService 初始化异常（{type(e).__name__}）")
             return False
     except Exception as e:
-        print_result(False, f"AI服务模块测试失败: {e}")
-        import traceback
-        traceback.print_exc()
+        print_result(False, f"AI服务模块测试失败（{type(e).__name__}）")
         return False
 
 def test_zhipu_api():
@@ -268,14 +266,7 @@ def test_zhipu_api():
     model_vision = os.getenv("ZHIPU_MODEL_VISION", "glm-4.6v-flash")
     model_text = os.getenv("ZHIPU_MODEL_TEXT", "glm-4.7-flash")
     
-    # 显示配置信息（隐藏敏感信息）
-    if api_key and len(api_key) > 30:
-        masked_key = f"{api_key[:20]}...{api_key[-10:]}"
-    else:
-        masked_key = "未配置"
-    
     print(f"  配置信息:")
-    print(f"    API Key: {masked_key}")
     print(f"    视觉模型: {model_vision}")
     print(f"    文本模型: {model_text}")
     
@@ -308,7 +299,7 @@ def test_zhipu_api():
         client = ZhipuAI(api_key=api_key)
         print_result(True, "客户端初始化成功")
     except Exception as e:
-        print_result(False, f"客户端初始化失败: {e}")
+        print_result(False, f"客户端初始化失败（{type(e).__name__}）")
         return False
     
     # 测试文本模型
@@ -330,7 +321,7 @@ def test_zhipu_api():
             return False
             
     except Exception as e:
-        print_result(False, f"文本模型测试失败: {e}")
+        print_result(False, f"文本模型测试失败（{type(e).__name__}）")
         if "401" in str(e) or "authentication" in str(e).lower():
             print("  提示: API Key 可能无效或已过期")
         elif "model" in str(e).lower():
@@ -385,7 +376,7 @@ def test_zhipu_api():
             return False
             
     except Exception as e:
-        print_result(False, f"视觉模型测试失败: {e}")
+        print_result(False, f"视觉模型测试失败（{type(e).__name__}）")
         if "401" in str(e) or "authentication" in str(e).lower():
             print("  提示: API Key 可能无效或已过期")
         elif "model" in str(e).lower():
@@ -518,11 +509,19 @@ def test_dependencies():
         print_result(False, f"依赖检查失败: {e}")
         return False
 
-def main():
+def main(argv=None):
     """主测试函数"""
     print("\n" + "="*60)
     print("SakuraFRP 自动签到脚本 - 测试套件")
     print("="*60)
+
+    parser = argparse.ArgumentParser(description="运行本地检查；实时 API 调用需显式启用")
+    parser.add_argument(
+        "--live-api",
+        action="store_true",
+        help="显式调用智谱文本和视觉API，消耗额度；不会由默认测试执行",
+    )
+    args = parser.parse_args(argv)
     
     # 检查Python环境
     is_in_venv, venv_exists = check_python_environment()
@@ -546,10 +545,11 @@ def main():
         ("配置文件", test_config_files),
         ("日志模块", test_logger),
         ("AI服务模块", test_ai_service),
-        ("智谱AI API", test_zhipu_api),
         ("定时脚本", test_scheduled_script),
         ("依赖检查", test_dependencies),
     ]
+    if args.live_api:
+        tests.append(("智谱AI API（实时调用）", test_zhipu_api))
     
     results = []
     for test_name, test_func in tests:
