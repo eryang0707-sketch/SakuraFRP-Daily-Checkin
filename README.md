@@ -140,10 +140,12 @@ python main.py --both
 
 ### 5.1 定时说明
 
-GitHub Actions 使用 UTC 时区。
+GitHub Actions 的 cron 使用 UTC；工作流中的 `TZ: Asia/Shanghai` 只影响任务启动后的进程时区，不会改变 cron 的计算时区。
 
-- 目标: 每天北京时间 12:00
-- 对应 cron: `0 4 * * *`
+- 目标：每天北京时间 12:07
+- 当前配置：`7 4 * * *`（04:07 UTC）
+
+GitHub Actions 的定时触发是尽力而为。GitHub 说明，Actions 高负载时定时事件可能延迟；负载足够高时，排队的作业也可能被丢弃。本项目把触发分钟设在 `:07` 以避开整点高峰，但这不能保证任务在 12:07 准时启动，单独调整 cron 分钟也不能消除平台触发延迟。详见 [GitHub Actions 定时事件说明](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#schedule)。
 
 ### 5.2 需要配置的 Secrets
 
